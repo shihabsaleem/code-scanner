@@ -1,63 +1,98 @@
 "use client";
 
 import React, { useEffect, useRef, useState, useCallback } from "react";
-import { BrowserMultiFormatReader } from "@zxing/browser";
-import { DecodeHintType, BarcodeFormat, RGBLuminanceSource, BinaryBitmap, HybridBinarizer, MultiFormatReader } from "@zxing/library";
-import { Camera, RefreshCcw, Square, Play, AlertCircle, CheckCircle2, Zap } from "lucide-react";
+import {
+  DecodeHintType,
+  BarcodeFormat,
+  RGBLuminanceSource,
+  BinaryBitmap,
+  HybridBinarizer,
+  MultiFormatReader,
+} from "@zxing/library";
+import {
+  Camera, RefreshCcw, Square, Play, AlertCircle, CheckCircle2, Zap, Cpu,
+} from "lucide-react";
 
-// ─── Reusable ZXing multi-format reader (created once, kept alive) ──────────
-const FORMATS = [
-  BarcodeFormat.QR_CODE,
-  BarcodeFormat.CODE_128,
-  BarcodeFormat.CODE_39,
-  BarcodeFormat.EAN_13,
-  BarcodeFormat.EAN_8,
-  BarcodeFormat.UPC_A,
-  BarcodeFormat.UPC_E,
-  BarcodeFormat.ITF,
-];
-
-function buildReader(): MultiFormatReader {
-  const hints = new Map<DecodeHintType, any>();
-  hints.set(DecodeHintType.POSSIBLE_FORMATS, FORMATS);
-  hints.set(DecodeHintType.TRY_HARDER, true);
-  const reader = new MultiFormatReader();
-  reader.setHints(hints);
-  return reader;
+// ─── Types ────────────────────────────────────────────────────────────────────
+declare global {
+  interface Window { BarcodeDetector?: any; }
 }
 
-// ─── Decode one video frame using ZXing low-level API ───────────────────────
-function decodeFrame(
+// ─── Constants ────────────────────────────────────────────────────────────────
+const NATIVE_FORMATS = ["qr_code", "code_128", "code_39", "ean_13", "ean_8", "upc_a", "upc_e", "itf"];
+
+const ZXING_FORMATS = [
+  BarcodeFormat.QR_CODE, BarcodeFormat.CODE_128, BarcodeFormat.CODE_39,
+  BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.UPC_A,
+  BarcodeFormat.UPC_E, BarcodeFormat.ITF,
+];
+
+// Max dimensions fed into ZXing — smaller = faster, still accurate enough
+const ZXING_MAX_W = 640;
+const ZXING_MAX_H = 360;
+
+// ─── ZXing reader (singleton) ─────────────────────────────────────────────────
+function buildZxingReader(): MultiFormatReader {
+  const hints = new Map<DecodeHintType, any>();
+  hints.set(DecodeHintType.POSSIBLE_FORMATS, ZXING_FORMATS);
+  hints.set(DecodeHintType.TRY_HARDER, false); // TRY_HARDER is slow on mobile; disable for speed
+  const r = new MultiFormatReader();
+  r.setHints(hints);
+  return r;
+}
+
+// ─── Decode helpers ───────────────────────────────────────────────────────────
+
+/**
+ * Native path: passes the <video> element directly — no canvas copy needed.
+ * Returns the detected value, or null.
+ */
+async function decodeNative(detector: any, video: HTMLVideoElement): Promise<string | null> {
+  try {
+    const results: any[] = await detector.detect(video);
+    return results.length > 0 ? (results[0].rawValue as string) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ZXing fallback: downscales the video to ZXING_MAX_W × ZXING_MAX_H
+ * before converting to greyscale, significantly reducing pixel work.
+ */
+function decodeZxing(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
   reader: MultiFormatReader
 ): string | null {
-  const { videoWidth: w, videoHeight: h } = video;
-  if (!w || !h) return null;
+  const { videoWidth: vw, videoHeight: vh } = video;
+  if (!vw || !vh) return null;
 
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  // Scale down proportionally so the largest side is at most the max dimension
+  const scale = Math.min(ZXING_MAX_W / vw, ZXING_MAX_H / vh, 1);
+  const w = Math.round(vw * scale);
+  const h = Math.round(vh * scale);
+
+  if (canvas.width !== w) canvas.width = w;
+  if (canvas.height !== h) canvas.height = h;
+
+  const ctx = canvas.getContext("2d", { willReadFrequently: true, alpha: false });
   if (!ctx) return null;
 
   ctx.drawImage(video, 0, 0, w, h);
   const { data } = ctx.getImageData(0, 0, w, h);
 
-  // Convert RGBA to luminance (greyscale) — ZXing needs Uint8ClampedArray
+  // Fast perceived-luminance conversion (avoids floating point)
   const luminance = new Uint8ClampedArray(w * h);
   for (let i = 0; i < luminance.length; i++) {
-    const r = data[i * 4];
-    const g = data[i * 4 + 1];
-    const b = data[i * 4 + 2];
-    // Perceived luminance weights
-    luminance[i] = (r * 77 + g * 151 + b * 28) >> 8;
+    const p = i * 4;
+    luminance[i] = (data[p] * 77 + data[p + 1] * 151 + data[p + 2] * 28) >> 8;
   }
 
   try {
-    const source = new RGBLuminanceSource(luminance, w, h);
-    const bitmap = new BinaryBitmap(new HybridBinarizer(source));
-    const result = reader.decode(bitmap);
-    return result.getText();
+    const src = new RGBLuminanceSource(luminance, w, h);
+    const bmp = new BinaryBitmap(new HybridBinarizer(src));
+    return reader.decode(bmp).getText();
   } catch {
     return null;
   }
@@ -65,30 +100,63 @@ function decodeFrame(
 
 // ─── Component ────────────────────────────────────────────────────────────────
 export default function BarcodeScanner() {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const rafRef = useRef<number | null>(null);
-  const readerRef = useRef<MultiFormatReader>(buildReader());
-  const lastScannedRef = useRef<string | null>(null);
-  const debounceRef = useRef<NodeJS.Timeout | null>(null);
+  const videoRef    = useRef<HTMLVideoElement>(null);
+  const canvasRef   = useRef<HTMLCanvasElement>(null);
+  const streamRef   = useRef<MediaStream | null>(null);
+  const rafRef      = useRef<number | null>(null);
+
+  // Prevents stacking async native detect() calls
+  const detectingRef    = useRef(false);
+  const nativeRef       = useRef<any>(null);
+  const zxingRef        = useRef<MultiFormatReader | null>(null);
+  const isNativeRef     = useRef(false);
+
+  const lastScannedRef  = useRef<string | null>(null);
+  const debounceRef     = useRef<NodeJS.Timeout | null>(null);
 
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [isScanning, setIsScanning] = useState(false);
-  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
-  const [facingMode, setFacingMode] = useState<"environment" | "user">("environment");
+  const [error,         setError]         = useState<string | null>(null);
+  const [isScanning,    setIsScanning]    = useState(false);
+  const [devices,       setDevices]       = useState<MediaDeviceInfo[]>([]);
+  const [facingMode,    setFacingMode]    = useState<"environment" | "user">("environment");
   const [scannedResult, setScannedResult] = useState<string | null>(null);
-  const [fps, setFps] = useState(0);
+  const [fps,           setFps]           = useState(0);
+  const [engineLabel,   setEngineLabel]   = useState<"Native" | "ZXing JS">("ZXing JS");
 
-  // FPS tracking
-  const fpsCounterRef = useRef({ count: 0, last: Date.now() });
+  const fpsRef = useRef({ count: 0, last: Date.now() });
 
-  // ── Beep ────────────────────────────────────────────────────────────────────
+  // ── Init engine ───────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const initEngine = async () => {
+      if (typeof window !== "undefined" && window.BarcodeDetector) {
+        try {
+          const supported: string[] = await window.BarcodeDetector.getSupportedFormats();
+          const available = NATIVE_FORMATS.filter((f) => supported.includes(f));
+          nativeRef.current = new window.BarcodeDetector({ formats: available.length ? available : NATIVE_FORMATS });
+          isNativeRef.current = true;
+          setEngineLabel("Native");
+          return;
+        } catch {
+          try {
+            nativeRef.current = new window.BarcodeDetector({ formats: NATIVE_FORMATS });
+            isNativeRef.current = true;
+            setEngineLabel("Native");
+            return;
+          } catch {}
+        }
+      }
+      // Fallback
+      zxingRef.current = buildZxingReader();
+      setEngineLabel("ZXing JS");
+    };
+    initEngine();
+  }, []);
+
+  // ── Beep ──────────────────────────────────────────────────────────────────────
   const playBeep = useCallback(() => {
     try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const osc = ctx.createOscillator();
+      const ctx  = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const osc  = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "sine";
       osc.frequency.setValueAtTime(900, ctx.currentTime);
@@ -101,65 +169,78 @@ export default function BarcodeScanner() {
     } catch {}
   }, []);
 
-  // ── Scan loop using requestAnimationFrame ───────────────────────────────────
+  // ── Handle a successful decode ────────────────────────────────────────────────
+  const handleDetected = useCallback((text: string) => {
+    if (text === lastScannedRef.current) return;
+    lastScannedRef.current = text;
+    setScannedResult(text);
+    playBeep();
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => { lastScannedRef.current = null; }, 2500);
+  }, [playBeep]);
+
+  // ── RAF scan loop ─────────────────────────────────────────────────────────────
   const scanLoop = useCallback(() => {
-    const video = videoRef.current;
+    const video  = videoRef.current;
     const canvas = canvasRef.current;
-    if (!video || !canvas || video.readyState < 2) {
+
+    if (!video || video.readyState < 2) {
       rafRef.current = requestAnimationFrame(scanLoop);
       return;
     }
 
     // FPS counter
     const now = Date.now();
-    fpsCounterRef.current.count++;
-    if (now - fpsCounterRef.current.last >= 1000) {
-      setFps(fpsCounterRef.current.count);
-      fpsCounterRef.current = { count: 0, last: now };
+    fpsRef.current.count++;
+    if (now - fpsRef.current.last >= 1000) {
+      setFps(fpsRef.current.count);
+      fpsRef.current = { count: 0, last: now };
     }
 
-    const text = decodeFrame(video, canvas, readerRef.current);
-
-    if (text && text !== lastScannedRef.current) {
-      lastScannedRef.current = text;
-      setScannedResult(text);
-      playBeep();
-
-      // Clear debounce so same code can scan again after 2.5s
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      debounceRef.current = setTimeout(() => {
-        lastScannedRef.current = null;
-      }, 2500);
+    if (isNativeRef.current && nativeRef.current) {
+      // ── Native path ────────────────────────────────────────────────────────
+      // Gate: only issue a new detect() when the previous one has resolved.
+      if (!detectingRef.current) {
+        detectingRef.current = true;
+        decodeNative(nativeRef.current, video).then((text) => {
+          detectingRef.current = false;
+          if (text) handleDetected(text);
+        });
+      }
+    } else if (zxingRef.current && canvas) {
+      // ── ZXing path (synchronous, always keep up) ──────────────────────────
+      const text = decodeZxing(video, canvas, zxingRef.current);
+      if (text) handleDetected(text);
     }
 
     rafRef.current = requestAnimationFrame(scanLoop);
-  }, [playBeep]);
+  }, [handleDetected]);
 
-  // ── Start camera + scan loop ────────────────────────────────────────────────
+  // ── Start ─────────────────────────────────────────────────────────────────────
   const startScanning = useCallback(async (facing: "environment" | "user" = facingMode) => {
     setError(null);
     setIsScanning(true);
     setScannedResult(null);
-    lastScannedRef.current = null;
+    lastScannedRef.current  = null;
+    detectingRef.current    = false;
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: { ideal: facing },
-          width: { ideal: 1280, max: 1280 },
-          height: { ideal: 720, max: 720 },
+          width:     { ideal: 1280, max: 1280 },
+          height:    { ideal: 720,  max: 720  },
           frameRate: { ideal: 30 },
         },
       });
 
       streamRef.current = stream;
-
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
 
-      fpsCounterRef.current = { count: 0, last: Date.now() };
+      fpsRef.current = { count: 0, last: Date.now() };
       rafRef.current = requestAnimationFrame(scanLoop);
     } catch (err: any) {
       setIsScanning(false);
@@ -171,24 +252,17 @@ export default function BarcodeScanner() {
     }
   }, [facingMode, scanLoop]);
 
-  // ── Stop scanning ───────────────────────────────────────────────────────────
+  // ── Stop ──────────────────────────────────────────────────────────────────────
   const stopScanning = useCallback(() => {
-    if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
+    if (rafRef.current !== null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
+    if (videoRef.current)  { videoRef.current.srcObject = null; }
+    detectingRef.current = false;
     setIsScanning(false);
     setFps(0);
   }, []);
 
-  // ── Switch front/back camera ────────────────────────────────────────────────
+  // ── Switch camera ─────────────────────────────────────────────────────────────
   const switchCamera = useCallback(() => {
     const next = facingMode === "environment" ? "user" : "environment";
     setFacingMode(next);
@@ -196,14 +270,13 @@ export default function BarcodeScanner() {
     setTimeout(() => startScanning(next), 200);
   }, [facingMode, stopScanning, startScanning]);
 
-  // ── Init: check permission + enumerate devices ──────────────────────────────
+  // ── Permission init ───────────────────────────────────────────────────────────
   useEffect(() => {
     const init = async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-        stream.getTracks().forEach((t) => t.stop());
+        const s = await navigator.mediaDevices.getUserMedia({ video: true });
+        s.getTracks().forEach((t) => t.stop());
         setHasPermission(true);
-
         const all = await navigator.mediaDevices.enumerateDevices();
         setDevices(all.filter((d) => d.kind === "videoinput"));
       } catch {
@@ -214,25 +287,33 @@ export default function BarcodeScanner() {
     return () => stopScanning();
   }, [stopScanning]);
 
-  // ─── UI ───────────────────────────────────────────────────────────────────
+  // ─── UI ───────────────────────────────────────────────────────────────────────
   if (hasPermission === false) {
     return (
       <div className="flex flex-col items-center justify-center p-8 bg-red-500/10 rounded-2xl border border-red-500/30 text-red-500">
         <AlertCircle className="w-12 h-12 mb-4" />
         <h3 className="text-xl font-bold mb-2">Camera Permission Denied</h3>
-        <p className="text-center opacity-80">
-          Please allow camera access in your browser settings and refresh the page.
-        </p>
+        <p className="text-center opacity-80">Please allow camera access in your browser settings and refresh.</p>
       </div>
     );
   }
 
   return (
     <div className="flex flex-col items-center w-full max-w-md mx-auto">
-      {/* Scanner Container */}
+
+      {/* Engine label */}
+      <div className="mb-4 flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
+        <Cpu className="w-4 h-4" />
+        Engine:&nbsp;
+        <span className={engineLabel === "Native" ? "text-emerald-500" : "text-amber-500"}>
+          {engineLabel}
+        </span>
+        {engineLabel === "Native" && <span className="text-emerald-400 normal-case tracking-normal">(hardware-accelerated ⚡)</span>}
+      </div>
+
+      {/* Viewport */}
       <div className="relative w-full aspect-4/3 bg-zinc-900 rounded-3xl overflow-hidden shadow-2xl border border-zinc-800">
 
-        {/* Video */}
         <video
           ref={videoRef}
           playsInline
@@ -240,10 +321,10 @@ export default function BarcodeScanner() {
           className={`w-full h-full object-cover transition-opacity duration-500 ${isScanning ? "opacity-100" : "opacity-0"}`}
         />
 
-        {/* Hidden canvas for frame capture */}
+        {/* Hidden canvas — only used by ZXing fallback */}
         <canvas ref={canvasRef} className="hidden" />
 
-        {/* Idle overlay */}
+        {/* Idle */}
         {!isScanning && (
           <div className="absolute inset-0 flex flex-col items-center justify-center text-zinc-500">
             <Camera className="w-16 h-16 mb-4 opacity-40" />
@@ -251,51 +332,38 @@ export default function BarcodeScanner() {
           </div>
         )}
 
-        {/* Scan frame overlay */}
+        {/* Scan overlay */}
         {isScanning && (
           <div className="absolute inset-0 pointer-events-none">
             <div className="w-full h-full border-40 border-black/40 box-border" />
-            {/* Sweep line */}
-            <div className="absolute top-10 left-10 right-10 h-0.5 bg-red-500 animate-[scan_1.5s_ease-in-out_infinite] shadow-[0_0_8px_rgba(239,68,68,0.9)]" />
-            {/* Corners */}
+            <div className="absolute top-10 left-10 right-10 h-0.5 bg-red-500 animate-[scan_1.2s_ease-in-out_infinite] shadow-[0_0_8px_rgba(239,68,68,0.9)]" />
             <div className="absolute top-8.75 left-8.75 w-8 h-8 border-t-4 border-l-4 border-white" />
             <div className="absolute top-8.75 right-8.75 w-8 h-8 border-t-4 border-r-4 border-white" />
             <div className="absolute bottom-8.75 left-8.75 w-8 h-8 border-b-4 border-l-4 border-white" />
             <div className="absolute bottom-8.75 right-8.75 w-8 h-8 border-b-4 border-r-4 border-white" />
-            {/* Green flash on detect */}
             {scannedResult && (
-              <div className="absolute inset-0 border-4 border-green-500 shadow-[inset_0_0_24px_rgba(34,197,94,0.6)] transition-all duration-200 pointer-events-none" />
+              <div className="absolute inset-0 border-4 border-green-500 shadow-[inset_0_0_24px_rgba(34,197,94,0.6)] transition-all duration-150 pointer-events-none" />
             )}
           </div>
         )}
 
-        {/* Top status bar */}
+        {/* Status + FPS */}
         <div className="absolute top-4 left-4 right-4 flex justify-between items-center z-10 pointer-events-none">
           <div className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider backdrop-blur-md flex items-center gap-2
-            ${isScanning
-              ? scannedResult
-                ? "bg-green-500/80 text-white"
-                : "bg-blue-500/80 text-white"
-              : "bg-zinc-800/80 text-zinc-400"
-            }`}>
+            ${isScanning ? (scannedResult ? "bg-green-500/80 text-white" : "bg-blue-500/80 text-white") : "bg-zinc-800/80 text-zinc-400"}`}>
             {isScanning ? (
               <>
                 <span className={`w-2 h-2 rounded-full bg-white ${!scannedResult && "animate-pulse"}`} />
                 {scannedResult ? "Detected!" : "Scanning…"}
               </>
             ) : (
-              <>
-                <Square className="w-3 h-3 fill-current" />
-                Stopped
-              </>
+              <><Square className="w-3 h-3 fill-current" /> Stopped</>
             )}
           </div>
 
-          {/* FPS badge */}
           {isScanning && fps > 0 && (
             <div className="px-2 py-1 rounded-full text-xs font-mono font-bold backdrop-blur-md bg-black/50 text-emerald-400 flex items-center gap-1">
-              <Zap className="w-3 h-3" />
-              {fps} fps
+              <Zap className="w-3 h-3" />{fps} fps
             </div>
           )}
         </div>
@@ -310,29 +378,20 @@ export default function BarcodeScanner() {
       {/* Controls */}
       <div className="mt-6 flex flex-wrap gap-4 justify-center">
         {!isScanning ? (
-          <button
-            onClick={() => startScanning()}
-            disabled={hasPermission === null}
-            className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded-2xl font-semibold shadow-lg shadow-blue-500/30 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <Play className="w-5 h-5 fill-current" />
-            Start Scanner
+          <button onClick={() => startScanning()} disabled={hasPermission === null}
+            className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded-2xl font-semibold shadow-lg shadow-blue-500/30 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
+            <Play className="w-5 h-5 fill-current" /> Start Scanner
           </button>
         ) : (
-          <button
-            onClick={stopScanning}
-            className="flex items-center gap-2 bg-zinc-800 hover:bg-zinc-700 text-white px-6 py-3 rounded-2xl font-semibold shadow-lg shadow-black/20 transition-all active:scale-95"
-          >
-            <Square className="w-5 h-5 fill-current" />
-            Stop Camera
+          <button onClick={stopScanning}
+            className="flex items-center gap-2 bg-zinc-800 hover:bg-zinc-700 text-white px-6 py-3 rounded-2xl font-semibold shadow-lg shadow-black/20 transition-all active:scale-95">
+            <Square className="w-5 h-5 fill-current" /> Stop Camera
           </button>
         )}
 
         {devices.length > 1 && (
-          <button
-            onClick={switchCamera}
-            className="flex items-center gap-2 bg-zinc-100 hover:bg-white text-zinc-900 px-6 py-3 rounded-2xl font-semibold shadow-lg shadow-black/5 transition-all active:scale-95"
-          >
+          <button onClick={switchCamera}
+            className="flex items-center gap-2 bg-zinc-100 hover:bg-white text-zinc-900 px-6 py-3 rounded-2xl font-semibold shadow-lg shadow-black/5 transition-all active:scale-95">
             <RefreshCcw className="w-5 h-5" />
             {facingMode === "environment" ? "Front Cam" : "Back Cam"}
           </button>
