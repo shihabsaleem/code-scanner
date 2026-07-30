@@ -175,6 +175,9 @@ export default function BarcodeScanner() {
         {/* Video Element */}
         <video 
           ref={videoRef}
+          playsInline
+          muted
+          autoPlay
           className={`w-full h-full object-cover ${!isScanning ? 'opacity-0' : 'opacity-100'} transition-opacity duration-500`}
         />
 
