@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useRef, useState, useCallback } from "react";
-import { BrowserMultiFormatReader, NotFoundException } from "@zxing/browser";
+import { BrowserMultiFormatReader } from "@zxing/browser";
 import { DecodeHintType, BarcodeFormat, RGBLuminanceSource, BinaryBitmap, HybridBinarizer, MultiFormatReader } from "@zxing/library";
 import { Camera, RefreshCcw, Square, Play, AlertCircle, CheckCircle2, Zap } from "lucide-react";
 
