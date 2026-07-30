@@ -2,7 +2,7 @@
 
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
-import { DecodeHintType, Result } from "@zxing/library";
+import { DecodeHintType, Result, BarcodeFormat } from "@zxing/library";
 import { Camera, RefreshCcw, Square, Play, AlertCircle, CheckCircle2 } from "lucide-react";
 
 export default function BarcodeScanner() {
@@ -101,11 +101,24 @@ export default function BarcodeScanner() {
     setScannedResult(null);
 
     try {
-      // Configure formats
+      // Configure formats for maximum performance
       const hints = new Map<DecodeHintType, any>();
-      // Using library defaults which include most 1D and 2D formats (QR, EAN, UPC, Code39, Code128, ITF, etc)
+      const formats = [
+        BarcodeFormat.QR_CODE,
+        BarcodeFormat.CODE_128,
+        BarcodeFormat.CODE_39,
+        BarcodeFormat.EAN_13,
+        BarcodeFormat.EAN_8,
+        BarcodeFormat.UPC_A,
+        BarcodeFormat.UPC_E,
+        BarcodeFormat.ITF,
+      ];
+      hints.set(DecodeHintType.POSSIBLE_FORMATS, formats);
       
-      readerRef.current = new BrowserMultiFormatReader(hints);
+      // Pass hints and reduce the delay between scans (default is usually 500ms)
+      readerRef.current = new BrowserMultiFormatReader(hints, {
+        delayBetweenScanAttempts: 150 
+      });
       
       controlsRef.current = await readerRef.current.decodeFromVideoDevice(
         selectedDeviceId,
